@@ -13,6 +13,10 @@ Type: `salt-masterless`
 The `salt-masterless` Terraform provisioner provisions machines built by Terraform
 using [Salt](http://saltstack.com/) states, without connecting to a Salt master. The `salt-masterless` provisioner supports `ssh` [connections](/docs/provisioners/connection.html).
 
+-> **Note:** Provisioners should only be used as a last resort. For most
+common situations there are better alternatives. For more information, see
+[the main Provisioners page](./).
+
 ## Requirements
 
 The `salt-masterless` provisioner has some prerequisites. `cURL` must be available on the remote host.
@@ -68,9 +72,6 @@ Optional:
     file](http://docs.saltstack.com/ref/configuration/minion.html). This will be
     uploaded to the `/etc/salt` on the remote. This option overrides the
     `remote_state_tree` or `remote_pillar_roots` options.
-
--   `grains_file` (string) - The path to your local [grains file](https://docs.saltstack.com/en/latest/topics/grains). This will be
-    uploaded to `/etc/salt/grains` on the remote.
 
 -   `skip_bootstrap` (boolean) - By default the salt provisioner runs [salt
     bootstrap](https://github.com/saltstack/salt-bootstrap) to install salt. Set

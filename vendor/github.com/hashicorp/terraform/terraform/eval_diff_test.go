@@ -1,146 +1,118 @@
 package terraform
 
 import (
-	"reflect"
 	"testing"
 
-	"github.com/hashicorp/terraform/config"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
 )
 
-func TestEvalFilterDiff(t *testing.T) {
-	ctx := new(MockEvalContext)
-
-	cases := []struct {
-		Node   *EvalFilterDiff
-		Input  *InstanceDiff
-		Output *InstanceDiff
+func TestProcessIgnoreChangesIndividual(t *testing.T) {
+	tests := map[string]struct {
+		Old, New cty.Value
+		Ignore   []string
+		Want     cty.Value
 	}{
-		// With no settings, it returns an empty diff
-		{
-			&EvalFilterDiff{},
-			&InstanceDiff{Destroy: true},
-			&InstanceDiff{},
+		"string": {
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.StringVal("a value"),
+				"b": cty.StringVal("b value"),
+			}),
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.StringVal("new a value"),
+				"b": cty.StringVal("new b value"),
+			}),
+			[]string{"a"},
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.StringVal("a value"),
+				"b": cty.StringVal("new b value"),
+			}),
 		},
-
-		// Destroy
-		{
-			&EvalFilterDiff{Destroy: true},
-			&InstanceDiff{Destroy: false},
-			&InstanceDiff{Destroy: false},
+		"changed type": {
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.StringVal("a value"),
+				"b": cty.StringVal("b value"),
+			}),
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.NumberIntVal(1),
+				"b": cty.StringVal("new b value"),
+			}),
+			[]string{"a"},
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.StringVal("a value"),
+				"b": cty.StringVal("new b value"),
+			}),
 		},
-		{
-			&EvalFilterDiff{Destroy: true},
-			&InstanceDiff{Destroy: true},
-			&InstanceDiff{Destroy: true},
+		"list": {
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.StringVal("a0 value"),
+					cty.StringVal("a1 value"),
+				}),
+				"b": cty.StringVal("b value"),
+			}),
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.StringVal("new a0 value"),
+					cty.StringVal("new a1 value"),
+				}),
+				"b": cty.StringVal("new b value"),
+			}),
+			[]string{"a"},
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.StringVal("a0 value"),
+					cty.StringVal("a1 value"),
+				}),
+				"b": cty.StringVal("new b value"),
+			}),
 		},
-		{
-			&EvalFilterDiff{Destroy: true},
-			&InstanceDiff{
-				Destroy: true,
-				Attributes: map[string]*ResourceAttrDiff{
-					"foo": &ResourceAttrDiff{},
-				},
-			},
-			&InstanceDiff{Destroy: true},
-		},
-		{
-			&EvalFilterDiff{Destroy: true},
-			&InstanceDiff{
-				Attributes: map[string]*ResourceAttrDiff{
-					"foo": &ResourceAttrDiff{
-						RequiresNew: true,
-					},
-				},
-			},
-			&InstanceDiff{Destroy: true},
-		},
-		{
-			&EvalFilterDiff{Destroy: true},
-			&InstanceDiff{
-				Attributes: map[string]*ResourceAttrDiff{
-					"foo": &ResourceAttrDiff{},
-				},
-			},
-			&InstanceDiff{Destroy: false},
+		"object attribute": {
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.ObjectVal(map[string]cty.Value{
+					"foo": cty.StringVal("a.foo value"),
+					"bar": cty.StringVal("a.bar value"),
+				}),
+				"b": cty.StringVal("b value"),
+			}),
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.ObjectVal(map[string]cty.Value{
+					"foo": cty.StringVal("new a.foo value"),
+					"bar": cty.StringVal("new a.bar value"),
+				}),
+				"b": cty.StringVal("new b value"),
+			}),
+			[]string{"a.bar"},
+			cty.ObjectVal(map[string]cty.Value{
+				"a": cty.ObjectVal(map[string]cty.Value{
+					"foo": cty.StringVal("new a.foo value"),
+					"bar": cty.StringVal("a.bar value"),
+				}),
+				"b": cty.StringVal("new b value"),
+			}),
 		},
 	}
 
-	for i, tc := range cases {
-		var output *InstanceDiff
-		tc.Node.Diff = &tc.Input
-		tc.Node.Output = &output
-		if _, err := tc.Node.Eval(ctx); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-
-		if !reflect.DeepEqual(output, tc.Output) {
-			t.Fatalf("bad: %d\n\n%#v", i, output)
-		}
-	}
-}
-
-func TestProcessIgnoreChangesOnResourceIgnoredWithRequiresNew(t *testing.T) {
-	var evalDiff *EvalDiff
-	var instanceDiff *InstanceDiff
-
-	var testDiffs = func(ignoreChanges []string, newAttribute string) (*EvalDiff, *InstanceDiff) {
-		return &EvalDiff{
-				Resource: &config.Resource{
-					Lifecycle: config.ResourceLifecycle{
-						IgnoreChanges: ignoreChanges,
-					},
-				},
-			},
-			&InstanceDiff{
-				Destroy: true,
-				Attributes: map[string]*ResourceAttrDiff{
-					"resource.changed": {
-						RequiresNew: true,
-						Type:        DiffAttrInput,
-						Old:         "old",
-						New:         "new",
-					},
-					"resource.unchanged": {
-						Old: "unchanged",
-						New: newAttribute,
-					},
-				},
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			ignore := make([]hcl.Traversal, len(test.Ignore))
+			for i, ignoreStr := range test.Ignore {
+				trav, diags := hclsyntax.ParseTraversalAbs([]byte(ignoreStr), "", hcl.Pos{Line: 1, Column: 1})
+				if diags.HasErrors() {
+					t.Fatalf("failed to parse %q: %s", ignoreStr, diags.Error())
+				}
+				ignore[i] = trav
 			}
-	}
 
-	evalDiff, instanceDiff = testDiffs([]string{"resource.changed"}, "unchanged")
-	err := evalDiff.processIgnoreChanges(instanceDiff)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if len(instanceDiff.Attributes) > 0 {
-		t.Fatalf("Expected all resources to be ignored, found %d", len(instanceDiff.Attributes))
-	}
+			ret, diags := processIgnoreChangesIndividual(test.Old, test.New, ignore)
+			if diags.HasErrors() {
+				t.Fatal(diags.Err())
+			}
 
-	evalDiff, instanceDiff = testDiffs([]string{}, "unchanged")
-	err = evalDiff.processIgnoreChanges(instanceDiff)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if len(instanceDiff.Attributes) != 2 {
-		t.Fatalf("Expected 2 resources to be found, found %d", len(instanceDiff.Attributes))
-	}
-
-	evalDiff, instanceDiff = testDiffs([]string{"resource.changed"}, "changed")
-	err = evalDiff.processIgnoreChanges(instanceDiff)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if len(instanceDiff.Attributes) != 1 {
-		t.Fatalf("Expected 1 resource to be found, found %d", len(instanceDiff.Attributes))
-	}
-
-	evalDiff, instanceDiff = testDiffs([]string{}, "changed")
-	err = evalDiff.processIgnoreChanges(instanceDiff)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if len(instanceDiff.Attributes) != 2 {
-		t.Fatalf("Expected 2 resource to be found, found %d", len(instanceDiff.Attributes))
+			if got, want := ret, test.Want; !want.RawEquals(got) {
+				t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, want)
+			}
+		})
 	}
 }

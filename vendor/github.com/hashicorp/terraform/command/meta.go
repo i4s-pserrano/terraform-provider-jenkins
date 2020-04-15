@@ -1,31 +1,30 @@
 package command
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-svchost/disco"
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/backend/local"
 	"github.com/hashicorp/terraform/command/format"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/command/webbrowser"
+	"github.com/hashicorp/terraform/configs/configload"
 	"github.com/hashicorp/terraform/helper/experiment"
-	"github.com/hashicorp/terraform/helper/variables"
 	"github.com/hashicorp/terraform/helper/wrappedstreams"
-	"github.com/hashicorp/terraform/svchost/auth"
-	"github.com/hashicorp/terraform/svchost/disco"
+	"github.com/hashicorp/terraform/providers"
+	"github.com/hashicorp/terraform/provisioners"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/mitchellh/cli"
@@ -50,10 +49,6 @@ type Meta struct {
 	// "terraform-native' services running at a specific user-facing hostname.
 	Services *disco.Disco
 
-	// Credentials provides access to credentials for "terraform-native"
-	// services, which are accessed by a service hostname.
-	Credentials auth.CredentialsSource
-
 	// RunningInAutomation indicates that commands are being run by an
 	// automated system rather than directly at a command prompt.
 	//
@@ -67,6 +62,14 @@ type Meta struct {
 	// the specific commands being run.
 	RunningInAutomation bool
 
+	// CLIConfigDir is the directory from which CLI configuration files were
+	// read by the caller and the directory where any changes to CLI
+	// configuration files by commands should be made.
+	//
+	// If this is empty then no configuration directory is available and
+	// commands which require one cannot proceed.
+	CLIConfigDir string
+
 	// PluginCacheDir, if non-empty, enables caching of downloaded plugins
 	// into the given directory.
 	PluginCacheDir string
@@ -75,6 +78,10 @@ type Meta struct {
 	// DataDir method for situations where the local .terraform/ directory
 	// is not suitable, e.g. because of a read-only filesystem.
 	OverrideDataDir string
+
+	// BrowserLauncher is used by commands that need to open a URL in a
+	// web browser.
+	BrowserLauncher webbrowser.Launcher
 
 	// When this channel is closed, the command will be cancelled.
 	ShutdownCh <-chan struct{}
@@ -102,17 +109,20 @@ type Meta struct {
 	// Private: do not set these
 	//----------------------------------------------------------
 
+	// configLoader is a shared configuration loader that is used by
+	// LoadConfig and other commands that access configuration files.
+	// It is initialized on first use.
+	configLoader *configload.Loader
+
 	// backendState is the currently active backend state
 	backendState *terraform.BackendState
 
 	// Variables for the context (private)
-	autoKey       string
-	autoVariables map[string]interface{}
-	input         bool
-	variables     map[string]interface{}
+	variableArgs rawFlags
+	input        bool
 
 	// Targets for this context (private)
-	targets []string
+	targets []addrs.Targetable
 
 	// Internal fields
 	color bool
@@ -128,15 +138,13 @@ type Meta struct {
 	//
 	// stateOutPath is used to override the output path for the state.
 	// If not provided, the StatePath is used causing the old state to
-	// be overriden.
+	// be overridden.
 	//
 	// backupPath is used to backup the state file before writing a modified
 	// version. It defaults to stateOutPath + DefaultBackupExtension
 	//
 	// parallelism is used to control the number of concurrent operations
 	// allowed when walking the graph
-	//
-	// shadow is used to enable/disable the shadow graph
 	//
 	// provider is to specify specific resource providers
 	//
@@ -149,16 +157,19 @@ type Meta struct {
 	// init.
 	//
 	// reconfigure forces init to ignore any stored configuration.
+	//
+	// compactWarnings (-compact-warnings) selects a more compact presentation
+	// of warnings in the output when they are not accompanied by errors.
 	statePath        string
 	stateOutPath     string
 	backupPath       string
 	parallelism      int
-	shadow           bool
 	provider         string
 	stateLock        bool
 	stateLockTimeout time.Duration
 	forceInitCopy    bool
 	reconfigure      bool
+	compactWarnings  bool
 
 	// Used with the import command to allow import of state when no matching config exists.
 	allowMissingConfig bool
@@ -170,8 +181,8 @@ type PluginOverrides struct {
 }
 
 type testingOverrides struct {
-	ProviderResolver terraform.ResourceProviderResolver
-	Provisioners     map[string]terraform.ResourceProvisionerFactory
+	ProviderResolver providers.Resolver
+	Provisioners     map[string]provisioners.Factory
 }
 
 // initStatePaths is used to initialize the default values for
@@ -235,8 +246,6 @@ func (m *Meta) InputMode() terraform.InputMode {
 
 	var mode terraform.InputMode
 	mode |= terraform.InputModeProvider
-	mode |= terraform.InputModeVar
-	mode |= terraform.InputModeVarUnset
 
 	return mode
 }
@@ -259,6 +268,63 @@ func (m *Meta) StdinPiped() bool {
 	return fi.Mode()&os.ModeNamedPipe != 0
 }
 
+// RunOperation executes the given operation on the given backend, blocking
+// until that operation completes or is interrupted, and then returns
+// the RunningOperation object representing the completed or
+// aborted operation that is, despite the name, no longer running.
+//
+// An error is returned if the operation either fails to start or is cancelled.
+// If the operation runs to completion then no error is returned even if the
+// operation itself is unsuccessful. Use the "Result" field of the
+// returned operation object to recognize operation-level failure.
+func (m *Meta) RunOperation(b backend.Enhanced, opReq *backend.Operation) (*backend.RunningOperation, error) {
+	if opReq.ConfigDir != "" {
+		opReq.ConfigDir = m.normalizePath(opReq.ConfigDir)
+	}
+
+	op, err := b.Operation(context.Background(), opReq)
+	if err != nil {
+		return nil, fmt.Errorf("error starting operation: %s", err)
+	}
+
+	// Wait for the operation to complete or an interrupt to occur
+	select {
+	case <-m.ShutdownCh:
+		// gracefully stop the operation
+		op.Stop()
+
+		// Notify the user
+		m.Ui.Output(outputInterrupt)
+
+		// Still get the result, since there is still one
+		select {
+		case <-m.ShutdownCh:
+			m.Ui.Error(
+				"Two interrupts received. Exiting immediately. Note that data\n" +
+					"loss may have occurred.")
+
+			// cancel the operation completely
+			op.Cancel()
+
+			// the operation should return asap
+			// but timeout just in case
+			select {
+			case <-op.Done():
+			case <-time.After(5 * time.Second):
+			}
+
+			return nil, errors.New("operation canceled")
+
+		case <-op.Done():
+			// operation completed after Stop
+		}
+	case <-op.Done():
+		// operation completed normally
+	}
+
+	return op, nil
+}
+
 const (
 	ProviderSkipVerifyEnvVar = "TF_SKIP_PROVIDER_VERIFY"
 )
@@ -267,25 +333,12 @@ const (
 // context with the settings from this Meta.
 func (m *Meta) contextOpts() *terraform.ContextOpts {
 	var opts terraform.ContextOpts
-	opts.Hooks = []terraform.Hook{m.uiHook(), &terraform.DebugHook{}}
+	opts.Hooks = []terraform.Hook{m.uiHook()}
 	opts.Hooks = append(opts.Hooks, m.ExtraHooks...)
-
-	vs := make(map[string]interface{})
-	for k, v := range opts.Variables {
-		vs[k] = v
-	}
-	for k, v := range m.autoVariables {
-		vs[k] = v
-	}
-	for k, v := range m.variables {
-		vs[k] = v
-	}
-	opts.Variables = vs
 
 	opts.Targets = m.targets
 	opts.UIInput = m.UIInput()
 	opts.Parallelism = m.parallelism
-	opts.Shadow = m.shadow
 
 	// If testingOverrides are set, we'll skip the plugin discovery process
 	// and just work with what we've been given, thus allowing the tests
@@ -310,68 +363,51 @@ func (m *Meta) contextOpts() *terraform.ContextOpts {
 	return &opts
 }
 
-// flags adds the meta flags to the given FlagSet.
-func (m *Meta) flagSet(n string) *flag.FlagSet {
+// defaultFlagSet creates a default flag set for commands.
+func (m *Meta) defaultFlagSet(n string) *flag.FlagSet {
 	f := flag.NewFlagSet(n, flag.ContinueOnError)
-	f.BoolVar(&m.input, "input", true, "input")
-	f.Var((*variables.Flag)(&m.variables), "var", "variables")
-	f.Var((*variables.FlagFile)(&m.variables), "var-file", "variable file")
-	f.Var((*FlagStringSlice)(&m.targets), "target", "resource to target")
-
-	if m.autoKey != "" {
-		f.Var((*variables.FlagFile)(&m.autoVariables), m.autoKey, "variable file")
-	}
-
-	// Advanced (don't need documentation, or unlikely to be set)
-	f.BoolVar(&m.shadow, "shadow", true, "shadow graph")
-
-	// Experimental features
-	experiment.Flag(f)
-
-	// Create an io.Writer that writes to our Ui properly for errors.
-	// This is kind of a hack, but it does the job. Basically: create
-	// a pipe, use a scanner to break it into lines, and output each line
-	// to the UI. Do this forever.
-	errR, errW := io.Pipe()
-	errScanner := bufio.NewScanner(errR)
-	go func() {
-		// This only needs to be alive long enough to write the help info if
-		// there is a flag error. Kill the scanner after a short duriation to
-		// prevent these from accumulating during tests, and cluttering up the
-		// stack traces.
-		time.AfterFunc(2*time.Second, func() {
-			errW.Close()
-		})
-		for errScanner.Scan() {
-			m.Ui.Error(errScanner.Text())
-		}
-	}()
-	f.SetOutput(errW)
+	f.SetOutput(ioutil.Discard)
 
 	// Set the default Usage to empty
 	f.Usage = func() {}
 
-	// command that bypass locking will supply their own flag on this var, but
-	// set the initial meta value to true as a failsafe.
-	m.stateLock = true
-
 	return f
 }
 
-// moduleStorage returns the module.Storage implementation used to store
-// modules for commands.
-func (m *Meta) moduleStorage(root string, mode module.GetMode) *module.Storage {
-	s := module.NewStorage(filepath.Join(root, "modules"), m.Services, m.Credentials)
-	s.Ui = m.Ui
-	s.Mode = mode
-	return s
+// extendedFlagSet adds custom flags that are mostly used by commands
+// that are used to run an operation like plan or apply.
+func (m *Meta) extendedFlagSet(n string) *flag.FlagSet {
+	f := m.defaultFlagSet(n)
+
+	f.BoolVar(&m.input, "input", true, "input")
+	f.Var((*FlagTargetSlice)(&m.targets), "target", "resource to target")
+	f.BoolVar(&m.compactWarnings, "compact-warnings", false, "use compact warnings")
+
+	if m.variableArgs.items == nil {
+		m.variableArgs = newRawFlags("-var")
+	}
+	varValues := m.variableArgs.Alias("-var")
+	varFiles := m.variableArgs.Alias("-var-file")
+	f.Var(varValues, "var", "variables")
+	f.Var(varFiles, "var-file", "variable file")
+
+	// Experimental features
+	experiment.Flag(f)
+
+	// commands that bypass locking will supply their own flag on this var,
+	// but set the initial meta value to true as a failsafe.
+	m.stateLock = true
+
+	return f
 }
 
 // process will process the meta-parameters out of the arguments. This
 // will potentially modify the args in-place. It will return the resulting
 // slice.
 //
-// vars says whether or not we support variables.
+// vars is now ignored. It used to control whether to process variables, but
+// that is no longer the responsibility of this function. (That happens
+// instead in Meta.collectVariableValues.)
 func (m *Meta) process(args []string, vars bool) ([]string, error) {
 	// We do this so that we retain the ability to technically call
 	// process multiple times, even if we have no plans to do so
@@ -401,51 +437,6 @@ func (m *Meta) process(args []string, vars bool) ([]string, error) {
 		},
 	}
 
-	// If we support vars and the default var file exists, add it to
-	// the args...
-	m.autoKey = ""
-	if vars {
-		var preArgs []string
-
-		if _, err := os.Stat(DefaultVarsFilename); err == nil {
-			m.autoKey = "var-file-default"
-			preArgs = append(preArgs, "-"+m.autoKey, DefaultVarsFilename)
-		}
-
-		if _, err := os.Stat(DefaultVarsFilename + ".json"); err == nil {
-			m.autoKey = "var-file-default"
-			preArgs = append(preArgs, "-"+m.autoKey, DefaultVarsFilename+".json")
-		}
-
-		wd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-
-		fis, err := ioutil.ReadDir(wd)
-		if err != nil {
-			return nil, err
-		}
-
-		// make sure we add the files in order
-		sort.Slice(fis, func(i, j int) bool {
-			return fis[i].Name() < fis[j].Name()
-		})
-
-		for _, fi := range fis {
-			name := fi.Name()
-			// Ignore directories, non-var-files, and ignored files
-			if fi.IsDir() || !isAutoVarFile(name) || config.IsIgnoredFile(name) {
-				continue
-			}
-
-			m.autoKey = "var-file-default"
-			preArgs = append(preArgs, "-"+m.autoKey, name)
-		}
-
-		args = append(preArgs, args...)
-	}
-
 	return args, nil
 }
 
@@ -464,7 +455,7 @@ func (m *Meta) confirm(opts *terraform.InputOpts) (bool, error) {
 	}
 
 	for i := 0; i < 2; i++ {
-		v, err := m.UIInput().Input(opts)
+		v, err := m.UIInput().Input(context.Background(), opts)
 		if err != nil {
 			return false, fmt.Errorf(
 				"Error asking for confirmation: %s", err)
@@ -492,13 +483,42 @@ func (m *Meta) confirm(opts *terraform.InputOpts) (bool, error) {
 func (m *Meta) showDiagnostics(vals ...interface{}) {
 	var diags tfdiags.Diagnostics
 	diags = diags.Append(vals...)
+	diags.Sort()
+
+	if len(diags) == 0 {
+		return
+	}
+
+	diags = diags.ConsolidateWarnings(1)
+
+	// Since warning messages are generally competing
+	if m.compactWarnings {
+		// If the user selected compact warnings and all of the diagnostics are
+		// warnings then we'll use a more compact representation of the warnings
+		// that only includes their summaries.
+		// We show full warnings if there are also errors, because a warning
+		// can sometimes serve as good context for a subsequent error.
+		useCompact := true
+		for _, diag := range diags {
+			if diag.Severity() != tfdiags.Warning {
+				useCompact = false
+				break
+			}
+		}
+		if useCompact {
+			msg := format.DiagnosticWarningsCompact(diags, m.Colorize())
+			msg = "\n" + msg + "\nTo see the full warning notes, run Terraform without -compact-warnings.\n"
+			m.Ui.Warn(msg)
+			return
+		}
+	}
 
 	for _, diag := range diags {
 		// TODO: Actually measure the terminal width and pass it here.
 		// For now, we don't have easy access to the writer that
 		// ui.Error (etc) are writing to and thus can't interrogate
 		// to see if it's a terminal and what size it is.
-		msg := format.Diagnostic(diag, m.Colorize(), 78)
+		msg := format.Diagnostic(diag, m.configSources(), m.Colorize(), 78)
 		switch diag.Severity() {
 		case tfdiags.Error:
 			m.Ui.Error(msg)
@@ -506,25 +526,6 @@ func (m *Meta) showDiagnostics(vals ...interface{}) {
 			m.Ui.Warn(msg)
 		default:
 			m.Ui.Output(msg)
-		}
-	}
-}
-
-const (
-	// ModuleDepthDefault is the default value for
-	// module depth, which can be overridden by flag
-	// or env var
-	ModuleDepthDefault = -1
-
-	// ModuleDepthEnvVar is the name of the environment variable that can be used to set module depth.
-	ModuleDepthEnvVar = "TF_MODULE_DEPTH"
-)
-
-func (m *Meta) addModuleDepthFlag(flags *flag.FlagSet, moduleDepth *int) {
-	flags.IntVar(moduleDepth, "module-depth", ModuleDepthDefault, "module-depth")
-	if envVar := os.Getenv(ModuleDepthEnvVar); envVar != "" {
-		if md, err := strconv.Atoi(envVar); err == nil {
-			*moduleDepth = md
 		}
 	}
 }

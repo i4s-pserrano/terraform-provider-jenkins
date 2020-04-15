@@ -12,6 +12,10 @@ The `file` provisioner is used to copy files or directories from the machine
 executing Terraform to the newly created resource. The `file` provisioner
 supports both `ssh` and `winrm` type [connections](/docs/provisioners/connection.html).
 
+-> **Note:** Provisioners should only be used as a last resort. For most
+common situations there are better alternatives. For more information, see
+[the main Provisioners page](./).
+
 ## Example usage
 
 ```hcl
@@ -80,7 +84,7 @@ of `/foo` on the local machine will be uploaded to `/tmp/foo` on the remote mach
 `foo` directory on the remote machine will be created by Terraform.
 
 If the source, however, is `/foo/` (a trailing slash is present), and the destination is
-`/tmp`, then the contents of `/foo` will be uploaded directly into `/tmp` directly.
+`/tmp`, then the contents of `/foo` will be uploaded directly into `/tmp`.
 
 This behavior was adopted from the standard behavior of
 [rsync](https://linux.die.net/man/1/rsync).

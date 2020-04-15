@@ -11,17 +11,21 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mitchellh/colorstring"
-
 	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/terraform-svchost/disco"
+	"github.com/hashicorp/terraform/command/cliconfig"
 	"github.com/hashicorp/terraform/command/format"
 	"github.com/hashicorp/terraform/helper/logging"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/httpclient"
+	"github.com/hashicorp/terraform/version"
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-shellwords"
 	"github.com/mitchellh/cli"
+	"github.com/mitchellh/colorstring"
 	"github.com/mitchellh/panicwrap"
 	"github.com/mitchellh/prefixedio"
+
+	backendInit "github.com/hashicorp/terraform/backend/init"
 )
 
 const (
@@ -105,15 +109,15 @@ func init() {
 		OutputPrefix: OutputPrefix,
 		InfoPrefix:   OutputPrefix,
 		ErrorPrefix:  ErrorPrefix,
-		Ui:           &cli.BasicUi{Writer: os.Stdout},
+		Ui: &cli.BasicUi{
+			Writer: os.Stdout,
+			Reader: os.Stdin,
+		},
 	}
 }
 
 func wrappedMain() int {
 	var err error
-
-	// We always need to close the DebugInfo before we exit.
-	defer terraform.CloseDebugInfo()
 
 	log.SetOutput(os.Stderr)
 	log.Printf(
@@ -122,7 +126,7 @@ func wrappedMain() int {
 	log.Printf("[INFO] Go runtime version: %s", runtime.Version())
 	log.Printf("[INFO] CLI args: %#v", os.Args)
 
-	config, diags := LoadConfig()
+	config, diags := cliconfig.LoadConfig()
 	if len(diags) > 0 {
 		// Since we haven't instantiated a command.Meta yet, we need to do
 		// some things manually here and use some "safe" defaults for things
@@ -134,7 +138,10 @@ func wrappedMain() int {
 				Disable: true, // Disable color to be conservative until we know better
 				Reset:   true,
 			}
-			Ui.Error(format.Diagnostic(diag, earlyColor, 78))
+			// We don't currently have access to the source code cache for
+			// the parser used to load the CLI config, so we can't show
+			// source code snippets in early diagnostics.
+			Ui.Error(format.Diagnostic(diag, nil, earlyColor, 78))
 		}
 		if diags.HasErrors() {
 			Ui.Error("As a result of the above problems, Terraform may not behave as intended.\n\n")
@@ -142,9 +149,27 @@ func wrappedMain() int {
 		}
 	}
 
+	// Get any configured credentials from the config and initialize
+	// a service discovery object.
+	credsSrc, err := credentialsSource(config)
+	if err != nil {
+		// Most commands don't actually need credentials, and most situations
+		// that would get us here would already have been reported by the config
+		// loading above, so we'll just log this one as an aid to debugging
+		// in the unlikely event that it _does_ arise.
+		log.Printf("[WARN] Cannot initialize remote host credentials manager: %s", err)
+		// credsSrc may be nil in this case, but that's okay because the disco
+		// object checks that and just acts as though no credentials are present.
+	}
+	services := disco.NewWithCredentialsSource(credsSrc)
+	services.SetUserAgent(httpclient.TerraformUserAgent(version.String()))
+
+	// Initialize the backends.
+	backendInit.Init(services)
+
 	// In tests, Commands may already be set to provide mock commands
 	if Commands == nil {
-		initCommands(config)
+		initCommands(config, services)
 	}
 
 	// Run checkpoint
@@ -218,36 +243,6 @@ func wrappedMain() int {
 	}
 
 	return exitCode
-}
-
-func cliConfigFile() (string, error) {
-	mustExist := true
-	configFilePath := os.Getenv("TERRAFORM_CONFIG")
-	if configFilePath == "" {
-		var err error
-		configFilePath, err = ConfigFile()
-		mustExist = false
-
-		if err != nil {
-			log.Printf(
-				"[ERROR] Error detecting default CLI config file path: %s",
-				err)
-		}
-	}
-
-	log.Printf("[DEBUG] Attempting to open CLI config file: %s", configFilePath)
-	f, err := os.Open(configFilePath)
-	if err == nil {
-		f.Close()
-		return configFilePath, nil
-	}
-
-	if mustExist || !os.IsNotExist(err) {
-		return "", err
-	}
-
-	log.Println("[DEBUG] File doesn't exist, but doesn't need to. Ignoring.")
-	return "", nil
 }
 
 // copyOutput uses output prefixes to determine whether data on stdout

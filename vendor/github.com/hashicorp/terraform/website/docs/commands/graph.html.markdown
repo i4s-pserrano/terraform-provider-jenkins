@@ -36,9 +36,11 @@ Options:
 * `-draw-cycles`    - Highlight any cycles in the graph with colored edges.
                       This helps when diagnosing cycle errors.
 
-* `-no-color`       - If specified, output won't contain any color.
+* `-type=plan`      - Type of graph to output. Can be: `plan`, `plan-destroy`, `apply`,
+                      `validate`, `input`, `refresh`.
 
-* `-type=plan`      - Type of graph to output. Can be: plan, plan-destroy, apply, legacy.
+* `-module-depth=n` - (deprecated) In prior versions of Terraform, specified the
+                      depth of modules to show in the output.
 
 ## Generating Images
 
@@ -47,7 +49,7 @@ easily be converted to an image by making use of `dot` provided
 by GraphViz:
 
 ```shell
-$ terraform graph | dot -Tpng > graph.png
+$ terraform graph | dot -Tsvg > graph.svg
 ```
 
 Here is an example graph output:

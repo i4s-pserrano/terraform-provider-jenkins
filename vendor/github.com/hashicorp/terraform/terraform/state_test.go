@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform/config"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/configs/hcl2shim"
 )
 
 func TestStateValidate(t *testing.T) {
@@ -51,13 +53,13 @@ func TestStateValidate(t *testing.T) {
 
 func TestStateAddModule(t *testing.T) {
 	cases := []struct {
-		In  [][]string
+		In  []addrs.ModuleInstance
 		Out [][]string
 	}{
 		{
-			[][]string{
-				[]string{"root"},
-				[]string{"root", "child"},
+			[]addrs.ModuleInstance{
+				addrs.RootModuleInstance,
+				addrs.RootModuleInstance.Child("child", addrs.NoKey),
 			},
 			[][]string{
 				[]string{"root"},
@@ -66,11 +68,11 @@ func TestStateAddModule(t *testing.T) {
 		},
 
 		{
-			[][]string{
-				[]string{"root", "foo", "bar"},
-				[]string{"root", "foo"},
-				[]string{"root"},
-				[]string{"root", "bar"},
+			[]addrs.ModuleInstance{
+				addrs.RootModuleInstance.Child("foo", addrs.NoKey).Child("bar", addrs.NoKey),
+				addrs.RootModuleInstance.Child("foo", addrs.NoKey),
+				addrs.RootModuleInstance,
+				addrs.RootModuleInstance.Child("bar", addrs.NoKey),
 			},
 			[][]string{
 				[]string{"root"},
@@ -81,12 +83,12 @@ func TestStateAddModule(t *testing.T) {
 		},
 		// Same last element, different middle element
 		{
-			[][]string{
-				[]string{"root", "foo", "bar"}, // This one should sort after...
-				[]string{"root", "foo"},
-				[]string{"root"},
-				[]string{"root", "bar", "bar"}, // ...this one.
-				[]string{"root", "bar"},
+			[]addrs.ModuleInstance{
+				addrs.RootModuleInstance.Child("foo", addrs.NoKey).Child("bar", addrs.NoKey), // This one should sort after...
+				addrs.RootModuleInstance.Child("foo", addrs.NoKey),
+				addrs.RootModuleInstance,
+				addrs.RootModuleInstance.Child("bar", addrs.NoKey).Child("bar", addrs.NoKey), // ...this one.
+				addrs.RootModuleInstance.Child("bar", addrs.NoKey),
 			},
 			[][]string{
 				[]string{"root"},
@@ -110,7 +112,7 @@ func TestStateAddModule(t *testing.T) {
 		}
 
 		if !reflect.DeepEqual(actual, tc.Out) {
-			t.Fatalf("In: %#v\n\nOut: %#v", tc.In, actual)
+			t.Fatalf("wrong result\ninput: %sgot:   %#v\nwant:  %#v", spew.Sdump(tc.In), actual, tc.Out)
 		}
 	}
 }
@@ -119,7 +121,7 @@ func TestStateOutputTypeRoundTrip(t *testing.T) {
 	state := &State{
 		Modules: []*ModuleState{
 			&ModuleState{
-				Path: RootModulePath,
+				Path: []string{"root"},
 				Outputs: map[string]*OutputState{
 					"string_output": &OutputState{
 						Value: "String Value",
@@ -144,113 +146,6 @@ func TestStateOutputTypeRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(state, roundTripped) {
 		t.Logf("expected:\n%#v", state)
 		t.Fatalf("got:\n%#v", roundTripped)
-	}
-}
-
-func TestStateModuleOrphans(t *testing.T) {
-	state := &State{
-		Modules: []*ModuleState{
-			&ModuleState{
-				Path: RootModulePath,
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "foo"},
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "bar"},
-			},
-		},
-	}
-
-	state.init()
-
-	config := testModule(t, "state-module-orphans").Config()
-	actual := state.ModuleOrphans(RootModulePath, config)
-	expected := [][]string{
-		[]string{RootModuleName, "foo"},
-	}
-
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
-	}
-}
-
-func TestStateModuleOrphans_nested(t *testing.T) {
-	state := &State{
-		Modules: []*ModuleState{
-			&ModuleState{
-				Path: RootModulePath,
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "foo", "bar"},
-			},
-		},
-	}
-
-	state.init()
-
-	actual := state.ModuleOrphans(RootModulePath, nil)
-	expected := [][]string{
-		[]string{RootModuleName, "foo"},
-	}
-
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
-	}
-}
-
-func TestStateModuleOrphans_nilConfig(t *testing.T) {
-	state := &State{
-		Modules: []*ModuleState{
-			&ModuleState{
-				Path: RootModulePath,
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "foo"},
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "bar"},
-			},
-		},
-	}
-
-	state.init()
-
-	actual := state.ModuleOrphans(RootModulePath, nil)
-	expected := [][]string{
-		[]string{RootModuleName, "foo"},
-		[]string{RootModuleName, "bar"},
-	}
-
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
-	}
-}
-
-func TestStateModuleOrphans_deepNestedNilConfig(t *testing.T) {
-	state := &State{
-		Modules: []*ModuleState{
-			&ModuleState{
-				Path: RootModulePath,
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "parent", "childfoo"},
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "parent", "childbar"},
-			},
-		},
-	}
-
-	state.init()
-
-	actual := state.ModuleOrphans(RootModulePath, nil)
-	expected := [][]string{
-		[]string{RootModuleName, "parent"},
-	}
-
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
 	}
 }
 
@@ -360,7 +255,7 @@ func TestStateEqual(t *testing.T) {
 			&State{
 				Modules: []*ModuleState{
 					&ModuleState{
-						Path: RootModulePath,
+						Path: []string{"root"},
 					},
 				},
 			},
@@ -373,14 +268,14 @@ func TestStateEqual(t *testing.T) {
 			&State{
 				Modules: []*ModuleState{
 					&ModuleState{
-						Path: RootModulePath,
+						Path: []string{"root"},
 					},
 				},
 			},
 			&State{
 				Modules: []*ModuleState{
 					&ModuleState{
-						Path: RootModulePath,
+						Path: []string{"root"},
 					},
 				},
 			},
@@ -1520,7 +1415,7 @@ func TestInstanceState_MergeDiff(t *testing.T) {
 	expected := map[string]string{
 		"foo": "baz",
 		"bar": "foo",
-		"baz": config.UnknownVariableValue,
+		"baz": hcl2shim.UnknownVariableValue,
 	}
 
 	if !reflect.DeepEqual(expected, is2.Attributes) {
@@ -1559,7 +1454,7 @@ func TestInstanceState_MergeDiff_computedSet(t *testing.T) {
 	expected := map[string]string{
 		"config.#":         "1",
 		"config.0.name":    "hello",
-		"config.0.rules.#": config.UnknownVariableValue,
+		"config.0.rules.#": hcl2shim.UnknownVariableValue,
 	}
 
 	if !reflect.DeepEqual(expected, is2.Attributes) {
@@ -1807,7 +1702,7 @@ func TestParseResourceStateKey(t *testing.T) {
 		{
 			Input: "aws_instance.foo.3",
 			Expected: &ResourceStateKey{
-				Mode:  config.ManagedResourceMode,
+				Mode:  ManagedResourceMode,
 				Type:  "aws_instance",
 				Name:  "foo",
 				Index: 3,
@@ -1816,7 +1711,7 @@ func TestParseResourceStateKey(t *testing.T) {
 		{
 			Input: "aws_instance.foo.0",
 			Expected: &ResourceStateKey{
-				Mode:  config.ManagedResourceMode,
+				Mode:  ManagedResourceMode,
 				Type:  "aws_instance",
 				Name:  "foo",
 				Index: 0,
@@ -1825,7 +1720,7 @@ func TestParseResourceStateKey(t *testing.T) {
 		{
 			Input: "aws_instance.foo",
 			Expected: &ResourceStateKey{
-				Mode:  config.ManagedResourceMode,
+				Mode:  ManagedResourceMode,
 				Type:  "aws_instance",
 				Name:  "foo",
 				Index: -1,
@@ -1834,7 +1729,7 @@ func TestParseResourceStateKey(t *testing.T) {
 		{
 			Input: "data.aws_ami.foo",
 			Expected: &ResourceStateKey{
-				Mode:  config.DataResourceMode,
+				Mode:  DataResourceMode,
 				Type:  "aws_ami",
 				Name:  "foo",
 				Index: -1,
@@ -1862,28 +1757,6 @@ func TestParseResourceStateKey(t *testing.T) {
 			t.Fatalf("%s: expected err: %t, got %s", tc.Input, tc.ExpectedErr, err)
 		}
 	}
-}
-
-func TestStateModuleOrphans_empty(t *testing.T) {
-	state := &State{
-		Modules: []*ModuleState{
-			&ModuleState{
-				Path: RootModulePath,
-			},
-			&ModuleState{
-				Path: []string{RootModuleName, "foo", "bar"},
-			},
-			&ModuleState{
-				Path: []string{},
-			},
-			nil,
-		},
-	}
-
-	state.init()
-
-	// just calling this to check for panic
-	state.ModuleOrphans(RootModulePath, nil)
 }
 
 func TestReadState_prune(t *testing.T) {
@@ -1969,6 +1842,20 @@ func TestReadState_pruneDependencies(t *testing.T) {
 
 	if len(resourceDeps) > 1 || resourceDeps[0] != "aws_instance.baz" {
 		t.Fatalf("expected 1 resource depends_on entry, got  %q", resourceDeps)
+	}
+}
+
+func TestReadState_bigHash(t *testing.T) {
+	expected := uint64(14885267135666261723)
+	s := strings.NewReader(`{"version": 3, "backend":{"hash":14885267135666261723}}`)
+
+	actual, err := ReadState(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if actual.Backend.Hash != expected {
+		t.Fatalf("expected backend hash %d, got %d", expected, actual.Backend.Hash)
 	}
 }
 

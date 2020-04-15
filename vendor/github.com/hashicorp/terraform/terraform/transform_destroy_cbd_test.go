@@ -1,175 +1,364 @@
 package terraform
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/plans"
+	"github.com/hashicorp/terraform/states"
 )
 
+func cbdTestGraph(t *testing.T, mod string, changes *plans.Changes, state *states.State) *Graph {
+	module := testModule(t, mod)
+
+	applyBuilder := &ApplyGraphBuilder{
+		Config:     module,
+		Changes:    changes,
+		Components: simpleMockComponentFactory(),
+		Schemas:    simpleTestSchemas(),
+		State:      state,
+	}
+	g, err := (&BasicGraphBuilder{
+		Steps: cbdTestSteps(applyBuilder.Steps()),
+		Name:  "ApplyGraphBuilder",
+	}).Build(addrs.RootModuleInstance)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	return filterInstances(g)
+}
+
+// override the apply graph builder to halt the process after CBD
+func cbdTestSteps(steps []GraphTransformer) []GraphTransformer {
+	found := false
+	var i int
+	var t GraphTransformer
+	for i, t = range steps {
+		if _, ok := t.(*CBDEdgeTransformer); ok {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		panic("CBDEdgeTransformer not found")
+	}
+
+	return steps[:i+1]
+}
+
+// remove extra nodes for easier test comparisons
+func filterInstances(g *Graph) *Graph {
+	for _, v := range g.Vertices() {
+		if _, ok := v.(GraphNodeResourceInstance); !ok {
+			g.Remove(v)
+		}
+
+	}
+	return g
+}
+
 func TestCBDEdgeTransformer(t *testing.T) {
-	g := Graph{Path: RootModulePath}
-	g.Add(&graphNodeCreatorTest{AddrString: "test.A"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.B"})
-	g.Add(&graphNodeDestroyerTest{AddrString: "test.A", CBD: true})
-
-	module := testModule(t, "transform-destroy-edge-basic")
-
-	{
-		tf := &DestroyEdgeTransformer{
-			Module: module,
-		}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
+	changes := &plans.Changes{
+		Resources: []*plans.ResourceInstanceChangeSrc{
+			{
+				Addr: mustResourceInstanceAddr("test_object.A"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.CreateThenDelete,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.B"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Update,
+				},
+			},
+		},
 	}
 
-	{
-		tf := &CBDEdgeTransformer{Module: module}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-	}
+	state := states.NewState()
+	root := state.EnsureModule(addrs.RootModuleInstance)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.A").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"A"}`),
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.B").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:       states.ObjectReady,
+			AttrsJSON:    []byte(`{"id":"B","test_list":["x"]}`),
+			Dependencies: []addrs.AbsResource{mustResourceAddr("test_object.A")},
+		},
+		mustProviderConfig("provider.test"),
+	)
+
+	g := cbdTestGraph(t, "transform-destroy-cbd-edge-basic", changes, state)
+	g = filterInstances(g)
 
 	actual := strings.TrimSpace(g.String())
-	expected := strings.TrimSpace(testTransformCBDEdgeBasicStr)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+	expected := regexp.MustCompile(strings.TrimSpace(`
+(?m)test_object.A
+test_object.A \(destroy deposed \w+\)
+  test_object.A
+  test_object.B
+test_object.B
+  test_object.A
+`))
+
+	if !expected.MatchString(actual) {
+		t.Fatalf("wrong result\n\ngot:\n%s\n\nwant:\n%s", actual, expected)
 	}
 }
 
-func TestCBDEdgeTransformer_depNonCBD(t *testing.T) {
-	g := Graph{Path: RootModulePath}
-	g.Add(&graphNodeCreatorTest{AddrString: "test.A"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.B"})
-	g.Add(&graphNodeDestroyerTest{AddrString: "test.A"})
-	g.Add(&graphNodeDestroyerTest{AddrString: "test.B", CBD: true})
-
-	module := testModule(t, "transform-destroy-edge-basic")
-
-	{
-		tf := &DestroyEdgeTransformer{
-			Module: module,
-		}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
+func TestCBDEdgeTransformerMulti(t *testing.T) {
+	changes := &plans.Changes{
+		Resources: []*plans.ResourceInstanceChangeSrc{
+			{
+				Addr: mustResourceInstanceAddr("test_object.A"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.CreateThenDelete,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.B"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.CreateThenDelete,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.C"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Update,
+				},
+			},
+		},
 	}
 
-	{
-		tf := &CBDEdgeTransformer{Module: module}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-	}
+	state := states.NewState()
+	root := state.EnsureModule(addrs.RootModuleInstance)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.A").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"A"}`),
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.B").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"B"}`),
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.C").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"C","test_list":["x"]}`),
+			Dependencies: []addrs.AbsResource{
+				mustResourceAddr("test_object.A"),
+				mustResourceAddr("test_object.B"),
+			},
+		},
+		mustProviderConfig("provider.test"),
+	)
+
+	g := cbdTestGraph(t, "transform-destroy-cbd-edge-multi", changes, state)
+	g = filterInstances(g)
 
 	actual := strings.TrimSpace(g.String())
-	expected := strings.TrimSpace(testTransformCBDEdgeDepNonCBDStr)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+	expected := regexp.MustCompile(strings.TrimSpace(`
+(?m)test_object.A
+test_object.A \(destroy deposed \w+\)
+  test_object.A
+  test_object.C
+test_object.B
+test_object.B \(destroy deposed \w+\)
+  test_object.B
+  test_object.C
+test_object.C
+  test_object.A
+  test_object.B
+`))
+
+	if !expected.MatchString(actual) {
+		t.Fatalf("wrong result\n\ngot:\n%s\n\nwant:\n%s", actual, expected)
 	}
 }
 
 func TestCBDEdgeTransformer_depNonCBDCount(t *testing.T) {
-	g := Graph{Path: RootModulePath}
-	g.Add(&graphNodeCreatorTest{AddrString: "test.A"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.B[0]"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.B[1]"})
-	g.Add(&graphNodeDestroyerTest{AddrString: "test.A", CBD: true})
-
-	module := testModule(t, "transform-destroy-edge-splat")
-
-	{
-		tf := &DestroyEdgeTransformer{
-			Module: module,
-		}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
+	changes := &plans.Changes{
+		Resources: []*plans.ResourceInstanceChangeSrc{
+			{
+				Addr: mustResourceInstanceAddr("test_object.A"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.CreateThenDelete,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.B[0]"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Update,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.B[1]"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Update,
+				},
+			},
+		},
 	}
 
-	{
-		tf := &CBDEdgeTransformer{Module: module}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-	}
+	state := states.NewState()
+	root := state.EnsureModule(addrs.RootModuleInstance)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.A").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"A"}`),
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.B[0]").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:       states.ObjectReady,
+			AttrsJSON:    []byte(`{"id":"B","test_list":["x"]}`),
+			Dependencies: []addrs.AbsResource{mustResourceAddr("test_object.A")},
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.B[1]").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:       states.ObjectReady,
+			AttrsJSON:    []byte(`{"id":"B","test_list":["x"]}`),
+			Dependencies: []addrs.AbsResource{mustResourceAddr("test_object.A")},
+		},
+		mustProviderConfig("provider.test"),
+	)
+
+	g := cbdTestGraph(t, "transform-cbd-destroy-edge-count", changes, state)
 
 	actual := strings.TrimSpace(g.String())
-	expected := strings.TrimSpace(`
-test.A
-test.A (destroy)
-  test.A
-  test.B[0]
-  test.B[1]
-test.B[0]
-test.B[1]
-	`)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+	expected := regexp.MustCompile(strings.TrimSpace(`
+(?m)test_object.A
+test_object.A \(destroy deposed \w+\)
+  test_object.A
+  test_object.B\[0\]
+  test_object.B\[1\]
+test_object.B\[0\]
+  test_object.A
+test_object.B\[1\]
+  test_object.A`))
+
+	if !expected.MatchString(actual) {
+		t.Fatalf("wrong result\n\ngot:\n%s\n\nwant:\n%s", actual, expected)
 	}
 }
 
 func TestCBDEdgeTransformer_depNonCBDCountBoth(t *testing.T) {
-	g := Graph{Path: RootModulePath}
-	g.Add(&graphNodeCreatorTest{AddrString: "test.A[0]"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.A[1]"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.B[0]"})
-	g.Add(&graphNodeCreatorTest{AddrString: "test.B[1]"})
-	g.Add(&graphNodeDestroyerTest{AddrString: "test.A[0]", CBD: true})
-	g.Add(&graphNodeDestroyerTest{AddrString: "test.A[1]", CBD: true})
-
-	module := testModule(t, "transform-destroy-edge-splat")
-
-	{
-		tf := &DestroyEdgeTransformer{
-			Module: module,
-		}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
+	changes := &plans.Changes{
+		Resources: []*plans.ResourceInstanceChangeSrc{
+			{
+				Addr: mustResourceInstanceAddr("test_object.A[0]"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.CreateThenDelete,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.A[1]"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.CreateThenDelete,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.B[0]"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Update,
+				},
+			},
+			{
+				Addr: mustResourceInstanceAddr("test_object.B[1]"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Update,
+				},
+			},
+		},
 	}
 
-	{
-		tf := &CBDEdgeTransformer{Module: module}
-		if err := tf.Transform(&g); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-	}
+	state := states.NewState()
+	root := state.EnsureModule(addrs.RootModuleInstance)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.A[0]").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"A"}`),
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.A[1]").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"A"}`),
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.B[0]").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:       states.ObjectReady,
+			AttrsJSON:    []byte(`{"id":"B","test_list":["x"]}`),
+			Dependencies: []addrs.AbsResource{mustResourceAddr("test_object.A")},
+		},
+		mustProviderConfig("provider.test"),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.B[1]").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:       states.ObjectReady,
+			AttrsJSON:    []byte(`{"id":"B","test_list":["x"]}`),
+			Dependencies: []addrs.AbsResource{mustResourceAddr("test_object.A")},
+		},
+		mustProviderConfig("provider.test"),
+	)
+
+	g := cbdTestGraph(t, "transform-cbd-destroy-edge-both-count", changes, state)
 
 	actual := strings.TrimSpace(g.String())
-	expected := strings.TrimSpace(`
-test.A[0]
-test.A[0] (destroy)
-  test.A[0]
-  test.B[0]
-  test.B[1]
-test.A[1]
-test.A[1] (destroy)
-  test.A[1]
-  test.B[0]
-  test.B[1]
-test.B[0]
-test.B[1]
-	`)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+	expected := regexp.MustCompile(strings.TrimSpace(`
+test_object.A\[0\]
+test_object.A\[0\] \(destroy deposed \w+\)
+  test_object.A\[0\]
+  test_object.A\[1\]
+  test_object.B\[0\]
+  test_object.B\[1\]
+test_object.A\[1\]
+test_object.A\[1\] \(destroy deposed \w+\)
+  test_object.A\[0\]
+  test_object.A\[1\]
+  test_object.B\[0\]
+  test_object.B\[1\]
+test_object.B\[0\]
+  test_object.A\[0\]
+  test_object.A\[1\]
+test_object.B\[1\]
+  test_object.A\[0\]
+  test_object.A\[1\]
+`))
+
+	if !expected.MatchString(actual) {
+		t.Fatalf("wrong result\n\ngot:\n%s\n\nwant:\n%s", actual, expected)
 	}
 }
-
-const testTransformCBDEdgeBasicStr = `
-test.A
-test.A (destroy)
-  test.A
-  test.B
-test.B
-`
-
-const testTransformCBDEdgeDepNonCBDStr = `
-test.A
-test.A (destroy) (modified)
-  test.A
-  test.B
-  test.B (destroy)
-test.B
-test.B (destroy)
-  test.B
-`

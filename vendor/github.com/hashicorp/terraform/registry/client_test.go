@@ -1,21 +1,98 @@
 package registry
 
 import (
+	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	version "github.com/hashicorp/go-version"
+	"github.com/hashicorp/terraform-svchost/disco"
+	"github.com/hashicorp/terraform/httpclient"
 	"github.com/hashicorp/terraform/registry/regsrc"
 	"github.com/hashicorp/terraform/registry/test"
-	"github.com/hashicorp/terraform/svchost/disco"
+	tfversion "github.com/hashicorp/terraform/version"
 )
+
+func TestConfigureDiscoveryRetry(t *testing.T) {
+	t.Run("default retry", func(t *testing.T) {
+		if discoveryRetry != defaultRetry {
+			t.Fatalf("expected retry %q, got %q", defaultRetry, discoveryRetry)
+		}
+
+		rc := NewClient(nil, nil)
+		if rc.client.RetryMax != defaultRetry {
+			t.Fatalf("expected client retry %q, got %q",
+				defaultRetry, rc.client.RetryMax)
+		}
+	})
+
+	t.Run("configured retry", func(t *testing.T) {
+		defer func(retryEnv string) {
+			os.Setenv(registryDiscoveryRetryEnvName, retryEnv)
+			discoveryRetry = defaultRetry
+		}(os.Getenv(registryDiscoveryRetryEnvName))
+		os.Setenv(registryDiscoveryRetryEnvName, "2")
+
+		configureDiscoveryRetry()
+		expected := 2
+		if discoveryRetry != expected {
+			t.Fatalf("expected retry %q, got %q",
+				expected, discoveryRetry)
+		}
+
+		rc := NewClient(nil, nil)
+		if rc.client.RetryMax != expected {
+			t.Fatalf("expected client retry %q, got %q",
+				expected, rc.client.RetryMax)
+		}
+	})
+}
+
+func TestConfigureRegistryClientTimeout(t *testing.T) {
+	t.Run("default timeout", func(t *testing.T) {
+		if requestTimeout != defaultRequestTimeout {
+			t.Fatalf("expected timeout %q, got %q",
+				defaultRequestTimeout.String(), requestTimeout.String())
+		}
+
+		rc := NewClient(nil, nil)
+		if rc.client.HTTPClient.Timeout != defaultRequestTimeout {
+			t.Fatalf("expected client timeout %q, got %q",
+				defaultRequestTimeout.String(), rc.client.HTTPClient.Timeout.String())
+		}
+	})
+
+	t.Run("configured timeout", func(t *testing.T) {
+		defer func(timeoutEnv string) {
+			os.Setenv(registryClientTimeoutEnvName, timeoutEnv)
+			requestTimeout = defaultRequestTimeout
+		}(os.Getenv(registryClientTimeoutEnvName))
+		os.Setenv(registryClientTimeoutEnvName, "20")
+
+		configureRequestTimeout()
+		expected := 20 * time.Second
+		if requestTimeout != expected {
+			t.Fatalf("expected timeout %q, got %q",
+				expected, requestTimeout.String())
+		}
+
+		rc := NewClient(nil, nil)
+		if rc.client.HTTPClient.Timeout != expected {
+			t.Fatalf("expected client timeout %q, got %q",
+				expected, rc.client.HTTPClient.Timeout.String())
+		}
+	})
+}
 
 func TestLookupModuleVersions(t *testing.T) {
 	server := test.Registry()
 	defer server.Close()
 
-	client := NewClient(test.Disco(server), nil, nil)
+	client := NewClient(test.Disco(server), nil)
 
 	// test with and without a hostname
 	for _, src := range []string{
@@ -27,7 +104,7 @@ func TestLookupModuleVersions(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		resp, err := client.Versions(modsrc)
+		resp, err := client.ModuleVersions(modsrc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -55,11 +132,28 @@ func TestLookupModuleVersions(t *testing.T) {
 	}
 }
 
+func TestInvalidRegistry(t *testing.T) {
+	server := test.Registry()
+	defer server.Close()
+
+	client := NewClient(test.Disco(server), nil)
+
+	src := "non-existent.localhost.localdomain/test-versions/name/provider"
+	modsrc, err := regsrc.ParseModuleSource(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.ModuleVersions(modsrc); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestRegistryAuth(t *testing.T) {
 	server := test.Registry()
 	defer server.Close()
 
-	client := NewClient(test.Disco(server), nil, nil)
+	client := NewClient(test.Disco(server), nil)
 
 	src := "private/name/provider"
 	mod, err := regsrc.ParseModuleSource(src)
@@ -67,25 +161,26 @@ func TestRegistryAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, err = client.ModuleVersions(mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ModuleLocation(mod, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Also test without a credentials source
+	client.services.SetCredentialsSource(nil)
+
 	// both should fail without auth
-	_, err = client.Versions(mod)
+	_, err = client.ModuleVersions(mod)
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	_, err = client.Location(mod, "1.0.0")
+	_, err = client.ModuleLocation(mod, "1.0.0")
 	if err == nil {
 		t.Fatal("expected error")
-	}
-
-	client = NewClient(test.Disco(server), test.Credentials, nil)
-
-	_, err = client.Versions(mod)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Location(mod, "1.0.0")
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -93,7 +188,7 @@ func TestLookupModuleLocationRelative(t *testing.T) {
 	server := test.Registry()
 	defer server.Close()
 
-	client := NewClient(test.Disco(server), nil, nil)
+	client := NewClient(test.Disco(server), nil)
 
 	src := "relative/foo/bar"
 	mod, err := regsrc.ParseModuleSource(src)
@@ -101,7 +196,7 @@ func TestLookupModuleLocationRelative(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := client.Location(mod, "0.2.0")
+	got, err := client.ModuleLocation(mod, "0.2.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +211,8 @@ func TestAccLookupModuleVersions(t *testing.T) {
 	if os.Getenv("TF_ACC") == "" {
 		t.Skip()
 	}
-	regDisco := disco.NewDisco()
+	regDisco := disco.New()
+	regDisco.SetUserAgent(httpclient.TerraformUserAgent(tfversion.String()))
 
 	// test with and without a hostname
 	for _, src := range []string{
@@ -128,8 +224,8 @@ func TestAccLookupModuleVersions(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		s := NewClient(regDisco, nil, nil)
-		resp, err := s.Versions(modsrc)
+		s := NewClient(regDisco, nil)
+		resp, err := s.ModuleVersions(modsrc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,21 +253,32 @@ func TestAccLookupModuleVersions(t *testing.T) {
 	}
 }
 
-// the error should reference the config source exatly, not the discovered path.
+// the error should reference the config source exactly, not the discovered path.
 func TestLookupLookupModuleError(t *testing.T) {
 	server := test.Registry()
 	defer server.Close()
 
-	client := NewClient(test.Disco(server), nil, nil)
+	client := NewClient(test.Disco(server), nil)
 
-	// this should not be found in teh registry
+	// this should not be found in the registry
 	src := "bad/local/path"
 	mod, err := regsrc.ParseModuleSource(src)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = client.Location(mod, "0.2.0")
+	// Instrument CheckRetry to make sure 404s are not retried
+	retries := 0
+	oldCheck := client.client.CheckRetry
+	client.client.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if retries > 0 {
+			t.Fatal("retried after module not found")
+		}
+		retries++
+		return oldCheck(ctx, resp, err)
+	}
+
+	_, err = client.ModuleLocation(mod, "0.2.0")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -180,4 +287,171 @@ func TestLookupLookupModuleError(t *testing.T) {
 	if !strings.Contains(err.Error(), `"bad/local/path"`) {
 		t.Fatal("error should not include the hostname. got:", err)
 	}
+}
+
+func TestLookupModuleRetryError(t *testing.T) {
+	server := test.RegistryRetryableErrorsServer()
+	defer server.Close()
+
+	client := NewClient(test.Disco(server), nil)
+
+	src := "example.com/test-versions/name/provider"
+	modsrc, err := regsrc.ParseModuleSource(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.ModuleVersions(modsrc)
+	if err == nil {
+		t.Fatal("expected requests to exceed retry", err)
+	}
+	if resp != nil {
+		t.Fatal("unexpected response", *resp)
+	}
+
+	// verify maxRetryErrorHandler handler returned the error
+	if !strings.Contains(err.Error(), "the request failed after 2 attempts, please try again later") {
+		t.Fatal("unexpected error, got:", err)
+	}
+}
+
+func TestLookupModuleNoRetryError(t *testing.T) {
+	// Disable retries
+	discoveryRetry = 0
+	defer configureDiscoveryRetry()
+
+	server := test.RegistryRetryableErrorsServer()
+	defer server.Close()
+
+	client := NewClient(test.Disco(server), nil)
+
+	src := "example.com/test-versions/name/provider"
+	modsrc, err := regsrc.ParseModuleSource(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.ModuleVersions(modsrc)
+	if err == nil {
+		t.Fatal("expected request to fail", err)
+	}
+	if resp != nil {
+		t.Fatal("unexpected response", *resp)
+	}
+
+	// verify maxRetryErrorHandler handler returned the error
+	if !strings.Contains(err.Error(), "the request failed, please try again later") {
+		t.Fatal("unexpected error, got:", err)
+	}
+}
+
+func TestLookupModuleNetworkError(t *testing.T) {
+	server := test.RegistryRetryableErrorsServer()
+	client := NewClient(test.Disco(server), nil)
+
+	// Shut down the server to simulate network failure
+	server.Close()
+
+	src := "example.com/test-versions/name/provider"
+	modsrc, err := regsrc.ParseModuleSource(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.ModuleVersions(modsrc)
+	if err == nil {
+		t.Fatal("expected request to fail", err)
+	}
+	if resp != nil {
+		t.Fatal("unexpected response", *resp)
+	}
+
+	// verify maxRetryErrorHandler handler returned the correct error
+	if !strings.Contains(err.Error(), "the request failed after 2 attempts, please try again later") {
+		t.Fatal("unexpected error, got:", err)
+	}
+}
+
+func TestLookupProviderVersions(t *testing.T) {
+	server := test.Registry()
+	defer server.Close()
+
+	client := NewClient(test.Disco(server), nil)
+
+	tests := []struct {
+		name string
+	}{
+		{"foo"},
+		{"bar"},
+	}
+	for _, tt := range tests {
+		provider := regsrc.NewTerraformProvider(tt.name, "", "")
+		resp, err := client.TerraformProviderVersions(provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		name := fmt.Sprintf("terraform-providers/%s", tt.name)
+		if resp.ID != name {
+			t.Fatalf("expected provider name %q, got %q", name, resp.ID)
+		}
+
+		if len(resp.Versions) != 2 {
+			t.Fatal("expected 2 versions, got", len(resp.Versions))
+		}
+
+		for _, v := range resp.Versions {
+			_, err := version.NewVersion(v.Version)
+			if err != nil {
+				t.Fatalf("invalid version %#v: %v", v, err)
+			}
+		}
+	}
+}
+
+func TestLookupProviderLocation(t *testing.T) {
+	server := test.Registry()
+	defer server.Close()
+
+	client := NewClient(test.Disco(server), nil)
+
+	tests := []struct {
+		Name    string
+		Version string
+		Err     bool
+	}{
+		{
+			"foo",
+			"0.2.3",
+			false,
+		},
+		{
+			"bar",
+			"0.1.1",
+			false,
+		},
+		{
+			"baz",
+			"0.0.0",
+			true,
+		},
+	}
+	for _, tt := range tests {
+		// FIXME: the tests are set up to succeed - os/arch is not being validated at this time
+		p := regsrc.NewTerraformProvider(tt.Name, "linux", "amd64")
+
+		locationMetadata, err := client.TerraformProviderLocation(p, tt.Version)
+		if tt.Err {
+			if err == nil {
+				t.Fatal("succeeded; want error")
+			}
+			return
+		} else if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		downloadURL := fmt.Sprintf("https://releases.hashicorp.com/terraform-provider-%s/%s/terraform-provider-%s.zip", tt.Name, tt.Version, tt.Name)
+
+		if locationMetadata.DownloadURL != downloadURL {
+			t.Fatalf("incorrect download URL: expected %q, got %q", downloadURL, locationMetadata.DownloadURL)
+		}
+	}
+
 }

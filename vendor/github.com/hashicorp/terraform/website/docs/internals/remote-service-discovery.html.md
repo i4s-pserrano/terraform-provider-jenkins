@@ -1,7 +1,7 @@
 ---
 layout: "docs"
 page_title: "Internals: Remote Service Discovery"
-sidebar_current: "docs-remote-service-discovery"
+sidebar_current: "docs-internals-remote-service-discovery"
 description: |-
   Remote service discovery is a protocol used to locate Terraform-native
   services provided at a user-friendly hostname.
@@ -83,8 +83,9 @@ version 1 of the module registry protocol:
 
 ## Supported Services
 
-At present, only one service identifier is in use:
+At present, the following service identifiers are in use:
 
+* `login.v1`: [login protocol version 1](/docs/commands/login.html#protocol-v1)
 * `modules.v1`: [module registry API version 1](/docs/registry/api.html)
 
 ## Authentication

@@ -3,14 +3,14 @@ package schema
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
+	"github.com/google/go-cmp/cmp"
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/configschema"
+	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/terraform"
 )
 
@@ -61,7 +61,7 @@ func TestProviderGetSchema(t *testing.T) {
 			BlockTypes: map[string]*configschema.NestedBlock{},
 		},
 		ResourceTypes: map[string]*configschema.Block{
-			"foo": &configschema.Block{
+			"foo": testResource(&configschema.Block{
 				Attributes: map[string]*configschema.Attribute{
 					"bar": &configschema.Attribute{
 						Type:     cty.String,
@@ -69,10 +69,10 @@ func TestProviderGetSchema(t *testing.T) {
 					},
 				},
 				BlockTypes: map[string]*configschema.NestedBlock{},
-			},
+			}),
 		},
 		DataSources: map[string]*configschema.Block{
-			"baz": &configschema.Block{
+			"baz": testResource(&configschema.Block{
 				Attributes: map[string]*configschema.Attribute{
 					"bur": &configschema.Attribute{
 						Type:     cty.String,
@@ -80,7 +80,7 @@ func TestProviderGetSchema(t *testing.T) {
 					},
 				},
 				BlockTypes: map[string]*configschema.NestedBlock{},
-			},
+			}),
 		},
 	}
 	got, err := p.GetSchema(&terraform.ProviderSchemaRequest{
@@ -91,8 +91,8 @@ func TestProviderGetSchema(t *testing.T) {
 		t.Fatalf("unexpected error %s", err)
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("wrong result\ngot: %swant: %s", spew.Sdump(got), spew.Sdump(want))
+	if !cmp.Equal(got, want, equateEmpty, typeComparer) {
+		t.Error("wrong result:\n", cmp.Diff(got, want, equateEmpty, typeComparer))
 	}
 }
 
@@ -156,12 +156,8 @@ func TestProviderConfigure(t *testing.T) {
 	}
 
 	for i, tc := range cases {
-		c, err := config.NewRawConfig(tc.Config)
-		if err != nil {
-			t.Fatalf("err: %s", err)
-		}
-
-		err = tc.P.Configure(terraform.NewResourceConfig(c))
+		c := terraform.NewResourceConfigRaw(tc.Config)
+		err := tc.P.Configure(c)
 		if err != nil != tc.Err {
 			t.Fatalf("%d: %s", i, err)
 		}
@@ -265,15 +261,91 @@ func TestProviderValidate(t *testing.T) {
 	}
 
 	for i, tc := range cases {
-		c, err := config.NewRawConfig(tc.Config)
-		if err != nil {
-			t.Fatalf("err: %s", err)
-		}
-
-		_, es := tc.P.Validate(terraform.NewResourceConfig(c))
+		c := terraform.NewResourceConfigRaw(tc.Config)
+		_, es := tc.P.Validate(c)
 		if len(es) > 0 != tc.Err {
 			t.Fatalf("%d: %#v", i, es)
 		}
+	}
+}
+
+func TestProviderDiff_legacyTimeoutType(t *testing.T) {
+	p := &Provider{
+		ResourcesMap: map[string]*Resource{
+			"blah": &Resource{
+				Schema: map[string]*Schema{
+					"foo": {
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+				Timeouts: &ResourceTimeout{
+					Create: DefaultTimeout(10 * time.Minute),
+				},
+			},
+		},
+	}
+
+	invalidCfg := map[string]interface{}{
+		"foo": 42,
+		"timeouts": []interface{}{
+			map[string]interface{}{
+				"create": "40m",
+			},
+		},
+	}
+	ic := terraform.NewResourceConfigRaw(invalidCfg)
+	_, err := p.Diff(
+		&terraform.InstanceInfo{
+			Type: "blah",
+		},
+		nil,
+		ic,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderDiff_timeoutInvalidValue(t *testing.T) {
+	p := &Provider{
+		ResourcesMap: map[string]*Resource{
+			"blah": &Resource{
+				Schema: map[string]*Schema{
+					"foo": {
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+				Timeouts: &ResourceTimeout{
+					Create: DefaultTimeout(10 * time.Minute),
+				},
+			},
+		},
+	}
+
+	invalidCfg := map[string]interface{}{
+		"foo": 42,
+		"timeouts": map[string]interface{}{
+			"create": "invalid",
+		},
+	}
+	ic := terraform.NewResourceConfigRaw(invalidCfg)
+	_, err := p.Diff(
+		&terraform.InstanceInfo{
+			Type: "blah",
+		},
+		nil,
+		ic,
+	)
+	if err == nil {
+		t.Fatal("Expected provider.Diff to fail with invalid timeout value")
+	}
+	expectedErrMsg := "time: invalid duration invalid"
+	if !strings.Contains(err.Error(), expectedErrMsg) {
+		t.Fatalf("Unexpected error message: %q\nExpected message to contain %q",
+			err.Error(),
+			expectedErrMsg)
 	}
 }
 
@@ -304,12 +376,8 @@ func TestProviderValidateResource(t *testing.T) {
 	}
 
 	for i, tc := range cases {
-		c, err := config.NewRawConfig(tc.Config)
-		if err != nil {
-			t.Fatalf("err: %s", err)
-		}
-
-		_, es := tc.P.ValidateResource(tc.Type, terraform.NewResourceConfig(c))
+		c := terraform.NewResourceConfigRaw(tc.Config)
+		_, es := tc.P.ValidateResource(tc.Type, c)
 		if len(es) > 0 != tc.Err {
 			t.Fatalf("%d: %#v", i, es)
 		}

@@ -21,11 +21,11 @@ will behave as expected.
 
 The optional `-out` argument can be used to save the generated plan to a file
 for later execution with `terraform apply`, which can be useful when
-[running Terraform in automation](/guides/running-terraform-in-automation.html).
+[running Terraform in automation](https://learn.hashicorp.com/terraform/development/running-terraform-in-automation).
 
 ## Usage
 
-Usage: `terraform plan [options] [dir-or-plan]`
+Usage: `terraform plan [options] [dir]`
 
 By default, `plan` requires no flags and looks in the current directory
 for the configuration and state file to refresh.
@@ -36,6 +36,10 @@ the `plan` command will not modify the given plan. This can be used to
 inspect a planfile.
 
 The command-line flags are all optional. The list of available flags are:
+
+* `-compact-warnings` - If Terraform produces any warnings that are not
+  accompanied by errors, show them in a more compact form that includes only
+  the summary messages.
 
 * `-destroy` - If set, generates a plan to destroy all the known resources.
 
@@ -52,10 +56,6 @@ The command-line flags are all optional. The list of available flags are:
 
 * `-lock-timeout=0s` - Duration to retry a state lock.
 
-* `-module-depth=n` - Specifies the depth of modules to show in the output.
-  This does not affect the plan itself, only the output shown. By default,
-  this is -1, which will expand all.
-
 * `-no-color` - Disables output with coloring.
 
 * `-out=path` - The path to save the generated execution plan. This plan
@@ -64,7 +64,8 @@ The command-line flags are all optional. The list of available flags are:
   plans below.
 
 * `-parallelism=n` - Limit the number of concurrent operation as Terraform
-  [walks the graph](/docs/internals/graph.html#walking-the-graph).
+  [walks the graph](/docs/internals/graph.html#walking-the-graph). Defaults
+  to 10.
 
 * `-refresh=true` - Update the state prior to checking for differences.
 
@@ -97,10 +98,10 @@ to specify the constraint. The resource address is interpreted as follows:
 
 * If the given address has a _resource spec_, only the specified resource
   is targeted. If the named resource uses `count` and no explicit index
-  is specified in the address, all of the instances sharing the given
+  is specified in the address (i.e. aws_instance.example[3]), all of the instances sharing the given
   resource name are targeted.
 
-* The the given address _does not_ have a resource spec, and instead just
+* If the given address _does not_ have a resource spec, and instead just
   specifies a module path, the target applies to all resources in the
   specified module _and_ all of the descendent modules of the specified
   module.
@@ -116,7 +117,7 @@ large configurations, prefer instead to break large configurations into
 several smaller configurations that can each be independently applied.
 [Data sources](/docs/configuration/data-sources.html) can be used to access
 information about resources created in other configurations, allowing
-a complex system architecture to be broken down into more managable parts
+a complex system architecture to be broken down into more manageable parts
 that can be updated independently.
 
 ## Security Warning
